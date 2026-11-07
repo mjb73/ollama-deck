@@ -6,7 +6,8 @@ load, unload and tune them from one compact window.
 ![the widget](docs/preview.png)
 
 It sits in a corner of the screen (always on top by default), polls your local Ollama server
-once a second, and draws live CPU, RAM and VRAM graphs next to your model list.
+once a second, and draws live CPU, RAM and VRAM graphs next to your model list. The memory
+numbers come from your own hardware — there is no built-in VRAM size to configure.
 
 ## What it does
 
@@ -16,6 +17,21 @@ once a second, and draws live CPU, RAM and VRAM graphs next to your model list.
 - **Keep-alive** control: 5 minutes, 15 minutes, 1 hour or forever — how long Ollama keeps the model resident after you stop using it.
 - **Live monitor**: system CPU, RAM and GPU memory usage with a one-minute sparkline, plus GPU load and the RSS/CPU of the `ollama` process itself.
 - **Stays on top** so it can live beside your editor. The TOP button toggles that.
+
+## Memory numbers come from your machine
+
+There is no hard-coded VRAM limit. Every second the widget asks the driver for the card's real
+total and used memory:
+
+- NVIDIA: `nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu`
+- AMD, and drivers that expose DRM sysfs: `mem_info_vram_total` / `mem_info_vram_used`
+
+The VRAM meter and the “free” figure therefore follow whatever card is installed — 8 GB, 16 GB,
+24 GB or more. If several GPUs are present, the one with the most memory is used (the usual case
+for a laptop with a small integrated GPU). When a model is reloaded, the widget compares the
+estimate with the memory that is actually free at that moment, plus whatever the selected model
+already holds. The “fits” pill is advice, not a cap: Ollama can still choose to put some layers
+in system RAM.
 
 ## Requirements
 
@@ -58,13 +74,36 @@ Launch **Ollama Deck** from the menu, or run `ollama-deck`.
 
 1. Pick a model. If something is already loaded, the widget selects it for you.
 2. Pick a context size. The line under the chips shows roughly how much VRAM the weights plus
-   the key/value cache will take; the pill on the right says whether that still fits next to
-   whatever is already resident.
+   the key/value cache will take, how much is free on the card right now, and whether that still
+   fits next to whatever is already resident.
 3. Press **Load**. The resident list appears above the graphs with its size, context and how
    long it has left before Ollama evicts it.
 4. Press the small × on a resident model to unload it, or **Unload** for the selected one.
 
 The window is resizable and remembers nothing between runs — it simply reflects the server.
+
+### When a model does not load the way you expected
+
+Ollama answers "done" even when the result is not the one you asked for, so the widget reads
+back the resident model from the server and tells you what really happened:
+
+- **VRAM climbs and then disappears.** The keep-alive request was being read as a number of
+  *seconds* rather than minutes, so the model was evicted a moment after loading. Durations are
+  now sent as `5m` / `15m` / `60m`, and the resident row counts down the time it has left.
+- **The context size stays what it was.** Ollama reuses the running model, so changing `num_ctx`
+  while the model is loaded has no effect. When the size you picked differs from the resident
+  one the button becomes **Reload**, which unloads first and then loads at the new size.
+- **The model is bigger than the card.** Ollama moves the layers that do not fit to system RAM.
+  The widget says so (`1.2 GB in RAM`) and the resident row splits VRAM from RAM instead of
+  pretending the whole model is on the GPU.
+- **VRAM fills up on a small model.** The key/value cache grows with the context, not the model
+  size. A 3B model at 128k can hold far more cache than its weights; try 8k or 16k, which the
+  estimate line shows before you press Load.
+- **The size is larger than the model supports.** Ollama silently caps it at the model's own
+  limit. The chips are limited to that maximum, and if the server still caps a request the
+  widget says `capped from 64k`.
+- **"not enough memory for that context".** The server's error is translated into that sentence
+  instead of a raw HTTP 500.
 
 ## How it works
 

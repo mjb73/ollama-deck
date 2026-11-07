@@ -68,6 +68,39 @@ pub fn pretty_endpoint() -> String {
         .to_string()
 }
 
+/// Turn the server's technical error text into something a person can act on.
+/// `None` means the message is already readable and is shown as it came.
+fn plain_error(detail: &str) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("requires more system memory") {
+        return Some(
+            "Ollama could not fit the model in memory. Lower the context size or pick a smaller model, then try again."
+                .to_string(),
+        );
+    }
+    if lower.contains("out of memory") || lower.contains("outofmemory") {
+        return Some(
+            "Memory ran out while loading. Lower the context size or choose a smaller model."
+                .to_string(),
+        );
+    }
+    if lower.contains("no space left on device") {
+        return Some("The disk is full, so Ollama could not unpack the model.".to_string());
+    }
+    if lower.contains("not found") && lower.contains("model") {
+        return Some(
+            "Ollama does not have that model. Pull it first, then reload the list.".to_string(),
+        );
+    }
+    if lower.contains("context") && lower.contains("exceed") {
+        return Some(
+            "The chosen context is larger than this model supports. Pick a smaller one."
+                .to_string(),
+        );
+    }
+    None
+}
+
 fn err_text(err: ureq::Error) -> String {
     match err {
         ureq::Error::Status(code, response) => {
@@ -81,6 +114,9 @@ fn err_text(err: ureq::Error) -> String {
                 })
                 .unwrap_or(body);
             let detail = detail.trim();
+            if let Some(plain) = plain_error(detail) {
+                return plain.to_string();
+            }
             if detail.is_empty() {
                 format!("HTTP {code}")
             } else {
@@ -238,7 +274,9 @@ pub fn show(model: &str) -> Result<ShowInfo, String> {
         .cloned()
         .unwrap_or_default();
 
-    let layers = find_number(&info, ".block_count").unwrap_or(0).min(u32::MAX as u64) as u32;
+    let layers = find_number(&info, ".block_count")
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
     let head_count = find_number(&info, ".attention.head_count")
         .unwrap_or(0)
         .min(u32::MAX as u64) as u32;
@@ -278,18 +316,75 @@ pub fn show(model: &str) -> Result<ShowInfo, String> {
     })
 }
 
-pub fn load(model: &str, ctx: u32, keep_alive_minutes: i64) -> Result<(), String> {
+/// What Ollama actually did with a load request, read back from `/api/ps`.
+///
+/// Ollama answers "done" even when it quietly capped the context at the
+/// model's own limit or moved part of the model to system RAM, so the only
+/// honest report is the one the server gives about the resident model.
+#[derive(Clone, Debug, Default)]
+pub struct LoadReport {
+    pub resident: bool,
+    pub ctx: u32,
+    pub size: u64,
+    pub size_vram: u64,
+}
+
+impl LoadReport {
+    pub fn on_cpu(&self) -> u64 {
+        self.size.saturating_sub(self.size_vram)
+    }
+}
+
+/// Two model names are the same model when they agree after dropping the
+/// implicit `:latest` tag.
+pub fn same_model(a: &str, b: &str) -> bool {
+    fn base(name: &str) -> &str {
+        name.split(':').next().unwrap_or(name)
+    }
+    a == b || (base(a) == base(b) && (!a.contains(':') || !b.contains(':')))
+}
+
+/// Ollama reads a bare number as **seconds**, so `5` means five seconds, not
+/// five minutes. Durations are sent as strings to keep the meaning explicit;
+/// `-1` is the documented "never unload" value.
+pub fn keep_alive_value(minutes: i64) -> Value {
+    if minutes <= 0 {
+        json!(-1)
+    } else {
+        json!(format!("{minutes}m"))
+    }
+}
+
+pub fn load(model: &str, ctx: u32, keep_alive_minutes: i64) -> Result<LoadReport, String> {
     post_json(
         "/api/generate",
         json!({
             "model": model,
             "prompt": "",
             "stream": false,
-            "keep_alive": keep_alive_minutes,
+            "keep_alive": keep_alive_value(keep_alive_minutes),
             "options": { "num_ctx": ctx }
         }),
-    )
-    .map(|_| ())
+    )?;
+
+    // Give the server a moment to publish the new resident model, then read
+    // back what it really holds in memory.
+    for attempt in 0..4 {
+        if let Ok(loaded) = ps() {
+            if let Some(entry) = loaded.iter().find(|l| same_model(&l.name, model)) {
+                return Ok(LoadReport {
+                    resident: true,
+                    ctx: entry.ctx,
+                    size: entry.size,
+                    size_vram: entry.size_vram,
+                });
+            }
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(LoadReport::default())
 }
 
 pub fn unload(model: &str) -> Result<(), String> {
@@ -303,4 +398,47 @@ pub fn unload(model: &str) -> Result<(), String> {
         }),
     )
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_alive_is_sent_as_a_duration_not_a_bare_number() {
+        // A bare 5 is five *seconds* to Ollama, which unloads the model right
+        // after it finished loading.
+        assert_eq!(keep_alive_value(5), json!("5m"));
+        assert_eq!(keep_alive_value(15), json!("15m"));
+        assert_eq!(keep_alive_value(60), json!("60m"));
+        assert_eq!(keep_alive_value(-1), json!(-1));
+    }
+
+    #[test]
+    fn latest_tag_matches_its_bare_name() {
+        assert!(same_model("llama3.2:3b", "llama3.2:3b"));
+        assert!(same_model("gemma4", "gemma4:latest"));
+        assert!(!same_model("llama3.2:3b", "llama3.2:1b"));
+        assert!(!same_model("qwen2.5-coder:14b", "gemma4:latest"));
+    }
+
+    /// Talks to a real Ollama; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs a running Ollama with llama3.2:3b"]
+    fn live_load_reads_back_the_resident_context() {
+        let model =
+            std::env::var("OLLAMA_DECK_TEST_MODEL").unwrap_or_else(|_| "llama3.2:3b".to_string());
+        let _ = unload(&model);
+        let report = load(&model, 8192, 5).expect("load request");
+        assert!(report.resident, "model should be resident after load");
+        assert_eq!(report.ctx, 8192, "context should match the request");
+        assert!(report.size_vram > 0, "model should occupy VRAM");
+
+        // The old payload asked for 131072 on a 32768 model; Ollama caps it.
+        let capped = load(&model, 131072, 5).expect("reload request");
+        assert!(capped.resident);
+        assert!(capped.ctx > 0 && capped.ctx <= 131072);
+
+        let _ = unload(&model);
+    }
 }

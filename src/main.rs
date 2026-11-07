@@ -206,11 +206,31 @@ impl Deck {
         let model = self.selected.clone();
         let ctx = self.ctx;
         let keep = KEEP_ALIVE[self.keep_idx.min(KEEP_ALIVE.len() - 1)];
+        let cloud = self
+            .models
+            .iter()
+            .find(|m| m.name == model)
+            .map(|m| m.cloud)
+            .unwrap_or(false);
+        // A resident model keeps its old context unless the runner is rebuilt,
+        // so a changed size means dropping the model first.
+        let reload = self
+            .loaded
+            .iter()
+            .find(|l| ollama::same_model(&l.name, &model))
+            .map(|l| l.ctx == 0 || l.ctx != ctx)
+            .unwrap_or(false);
         self.busy = Some((OpKind::Load, model.clone()));
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            if reload {
+                if let Err(e) = ollama::unload(&model) {
+                    let _ = tx.send(Msg::Op { ok: false, text: e });
+                    return;
+                }
+            }
             let (ok, text) = match ollama::load(&model, ctx, keep) {
-                Ok(()) => (true, format!("{} ready · {} context", short_name(&model), fmt_ctx(ctx))),
+                Ok(report) => load_message(&model, ctx, cloud, report),
                 Err(e) => (false, e),
             };
             let _ = tx.send(Msg::Op { ok, text });
@@ -309,9 +329,8 @@ impl Deck {
             }
         }
 
-        if !self.online && self.models.is_empty() {
-            self.refresh_models();
-        } else if self.online && self.last_models.elapsed() > Duration::from_secs(45) {
+        let stale = self.last_models.elapsed() > Duration::from_secs(45);
+        if (!self.online && self.models.is_empty()) || (self.online && stale) {
             self.refresh_models();
         }
     }
@@ -376,7 +395,9 @@ impl Deck {
     }
 
     fn is_loaded(&self, name: &str) -> bool {
-        self.loaded.iter().any(|l| l.name == name)
+        self.loaded
+            .iter()
+            .any(|l| ollama::same_model(&l.name, name))
     }
 
     // ------------------------------------------------------------ drawing
@@ -405,7 +426,11 @@ impl Deck {
                         egui::WindowLevel::Normal
                     }));
                 }
-                let refresh_tip = if self.quiet { "" } else { "Reload the model list" };
+                let refresh_tip = if self.quiet {
+                    ""
+                } else {
+                    "Reload the model list"
+                };
                 if icon_button(ui, Icon::Refresh, false, refresh_tip).clicked() {
                     self.refresh_models();
                 }
@@ -438,6 +463,16 @@ impl Deck {
 
     fn model_card(&mut self, ui: &mut egui::Ui) {
         let loaded_selected = self.is_loaded(&self.selected);
+        let resident_ctx = self
+            .loaded
+            .iter()
+            .find(|l| ollama::same_model(&l.name, &self.selected))
+            .map(|l| l.ctx)
+            .unwrap_or(0);
+        // Ollama only rebuilds its runner (and therefore its context window)
+        // when the model is dropped first; asking for a new size while it is
+        // resident silently keeps the old one.
+        let ctx_changed = loaded_selected && (resident_ctx == 0 || resident_ctx != self.ctx);
 
         ui.horizontal(|ui| {
             section_label(ui, "MODEL");
@@ -538,26 +573,48 @@ impl Deck {
 
         ui.add_space(3.0);
         ui.horizontal(|ui| {
-            let text = match self.estimate() {
-                Some((_, kv, total)) => {
-                    format!("≈ {} needed · {} cache", fmt_bytes(total), fmt_bytes(kv))
+            let text = if ctx_changed {
+                let loaded_at = if resident_ctx > 0 {
+                    fmt_ctx(resident_ctx)
+                } else {
+                    "an unknown size".to_string()
+                };
+                format!(
+                    "loaded at {} · press Reload to apply {}",
+                    loaded_at,
+                    fmt_ctx(self.ctx)
+                )
+            } else {
+                match self.estimate() {
+                    Some((_, kv, total)) => {
+                        if self.sample.vram_total > 0 {
+                            format!(
+                                "≈ {} needed · {} cache · {} free",
+                                fmt_bytes(total),
+                                fmt_bytes(kv),
+                                fmt_bytes(self.sample.vram_free())
+                            )
+                        } else {
+                            format!("≈ {} needed · {} cache", fmt_bytes(total), fmt_bytes(kv))
+                        }
+                    }
+                    None => "≈ weights only until the model reports its size".to_string(),
                 }
-                None => "≈ weights only until the model reports its size".to_string(),
             };
-            let resident: u64 = self
+            let selected_vram: u64 = self
                 .loaded
                 .iter()
-                .filter(|l| l.name != self.selected)
+                .filter(|l| ollama::same_model(&l.name, &self.selected))
                 .map(|l| l.size_vram)
                 .sum();
-            let fits = self
-                .estimate()
-                .map(|(_, _, total)| {
-                    self.sample.vram_total == 0
-                        || total + resident < (self.sample.vram_total as f64 * 0.96) as u64
-                })
-                .unwrap_or(true);
-            tiny(ui, &text, if fits { FAINT } else { WARN });
+            // Reloading this model frees its own VRAM first, so the budget is
+            // what is free right now plus whatever this model already holds.
+            let available = self.sample.vram_free().saturating_add(selected_vram);
+            let fits = match self.estimate() {
+                Some((_, _, total)) if self.sample.vram_total > 0 => total <= available,
+                _ => true,
+            };
+            tiny(ui, &text, if fits && !ctx_changed { FAINT } else { WARN });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.sample.vram_total > 0 && self.estimate().is_some() {
                     if fits {
@@ -579,6 +636,8 @@ impl Deck {
                 .unwrap_or(false);
             let load_label = if busy_here {
                 "Loading…"
+            } else if ctx_changed {
+                "Reload"
             } else if loaded_selected {
                 "Loaded"
             } else {
@@ -586,22 +645,27 @@ impl Deck {
             };
             let can_load = self.online
                 && !self.selected.is_empty()
-                && !loaded_selected
+                && (!loaded_selected || ctx_changed)
                 && self.busy.is_none();
             let w = (ui.available_width() - 78.0) * 0.5;
             let load_btn = primary_button(ui, load_label, can_load, w.max(70.0));
-            if tip(
-                load_btn,
-                "Load this model into memory with the chosen context size",
-                self.quiet,
-            )
-            .clicked()
-            {
+            let load_tip = if ctx_changed {
+                "Unload this model and load it again so the new context size takes effect"
+            } else {
+                "Load this model into memory with the chosen context size"
+            };
+            if tip(load_btn, load_tip, self.quiet).clicked() {
                 self.start_load();
             }
             let can_unload = self.online && loaded_selected && self.busy.is_none();
             let unload_btn = ghost_button(ui, "Unload", can_unload, w.max(70.0));
-            if tip(unload_btn, "Free this model's memory straight away", self.quiet).clicked() {
+            if tip(
+                unload_btn,
+                "Free this model's memory straight away",
+                self.quiet,
+            )
+            .clicked()
+            {
                 self.start_unload(self.selected.clone());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -716,10 +780,15 @@ impl Deck {
                         egui::pos2(rect.right() - 15.0, rect.center().y),
                         Vec2::splat(24.0),
                     );
-                    let btn = ui.interact(kill, ui.scope_id().with(("unload", &item.name)), Sense::click());
+                    let btn = ui.interact(
+                        kill,
+                        ui.scope_id().with(("unload", &item.name)),
+                        Sense::click(),
+                    );
                     let color = if btn.hovered() { BAD } else { FAINT };
                     if btn.hovered() {
-                        ui.painter().rect_filled(kill, CornerRadius::same(4), CARD_HI);
+                        ui.painter()
+                            .rect_filled(kill, CornerRadius::same(4), CARD_HI);
                     }
                     draw_icon(ui.painter(), kill.center(), 8.0, Icon::Cross, color, 1.2);
                     if btn.clicked() {
@@ -760,7 +829,11 @@ impl Deck {
             section_label(ui, "LIVE");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let note = if let Some(pid) = s.ollama_pid {
-                    format!("ollama {:.0}% · {} · pid {pid}", s.ollama_cpu, fmt_bytes(s.ollama_rss))
+                    format!(
+                        "ollama {:.0}% · {} · pid {pid}",
+                        s.ollama_cpu,
+                        fmt_bytes(s.ollama_rss)
+                    )
                 } else {
                     "ollama process idle".to_string()
                 };
@@ -772,8 +845,26 @@ impl Deck {
         let per_meter = ((ui.available_height() - gpu_line) / 3.0).max(34.0);
         let spark_h = (per_meter - 30.0).clamp(8.0, 58.0);
 
-        meter(ui, "CPU", &cpu_val, s.cpu_pct / 100.0, None, &self.cpu_hist, ACCENT, spark_h);
-        meter(ui, "RAM", &ram_val, ram_frac.unwrap_or(0.0), ram_frac, &self.ram_hist, BLUE, spark_h);
+        meter(
+            ui,
+            "CPU",
+            &cpu_val,
+            s.cpu_pct / 100.0,
+            None,
+            &self.cpu_hist,
+            ACCENT,
+            spark_h,
+        );
+        meter(
+            ui,
+            "RAM",
+            &ram_val,
+            ram_frac.unwrap_or(0.0),
+            ram_frac,
+            &self.ram_hist,
+            BLUE,
+            spark_h,
+        );
         meter(
             ui,
             "VRAM",
@@ -797,7 +888,24 @@ impl Deck {
             } else {
                 self.sample.gpu_name.clone()
             };
-            tiny(ui, &format!("{name} · {gpu}"), FAINT);
+            let line = ui.label(
+                RichText::new(format!(
+                    "{name} · {} free · {gpu}",
+                    fmt_bytes(self.sample.vram_free())
+                ))
+                .font(FontId::monospace(8.5))
+                .color(FAINT),
+            );
+            let source = if self.sample.gpu_source.is_empty() {
+                "the graphics driver"
+            } else {
+                &self.sample.gpu_source
+            };
+            tip(
+                line,
+                &format!("memory numbers come from {source}"),
+                self.quiet,
+            );
         }
     }
 
@@ -831,13 +939,22 @@ impl Deck {
 
     fn footer(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            let note = if self.sample.gpu_source.is_empty() {
+                "RAM / VRAM / CPU · 1 s samples".to_string()
+            } else {
+                format!("CPU · RAM · VRAM · 1 s · {}", self.sample.gpu_source)
+            };
             ui.label(
-                RichText::new("RAM / VRAM / CPU · 1 s samples")
+                RichText::new(note)
                     .font(FontId::monospace(8.5))
                     .color(FAINT),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (text, color) = if self.online { ("live", OK) } else { ("paused", FAINT) };
+                let (text, color) = if self.online {
+                    ("live", OK)
+                } else {
+                    ("paused", FAINT)
+                };
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
                 ui.painter().circle_filled(rect.center(), 2.5, color);
                 ui.add_space(3.0);
@@ -988,14 +1105,16 @@ fn tip(resp: egui::Response, text: &str, quiet: bool) -> egui::Response {
 }
 
 fn tiny(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.label(RichText::new(text).font(FontId::monospace(8.5)).color(color));
+    ui.label(
+        RichText::new(text)
+            .font(FontId::monospace(8.5))
+            .color(color),
+    );
 }
 
 fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     let font = FontId::monospace(8.5);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_string(), font, color);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(galley.size().x + 13.0, 15.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let bg = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24);
@@ -1012,9 +1131,7 @@ fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 fn chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let font = FontId::monospace(9.5);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, TXT);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, TXT);
     let size = Vec2::new(galley.size().x + 13.0, 20.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let (bg, stroke, fg) = if selected {
@@ -1060,9 +1177,7 @@ fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool, width: f32) -> 
 
 fn ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool, width: f32) -> egui::Response {
     let font = FontId::monospace(10.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font, DIM);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, DIM);
     let w = if width > 0.0 {
         width
     } else {
@@ -1182,13 +1297,11 @@ fn meter(
 ) {
     ui.add_space(3.0);
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .font(FontId::monospace(9.0))
-                .color(DIM),
-        );
+        ui.label(RichText::new(label).font(FontId::monospace(9.0)).color(DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let pct = frac.map(|f| format!("  {:.0}%", f * 100.0)).unwrap_or_default();
+            let pct = frac
+                .map(|f| format!("  {:.0}%", f * 100.0))
+                .unwrap_or_default();
             ui.label(
                 RichText::new(format!("{value}{pct}"))
                     .font(FontId::monospace(10.5))
@@ -1257,6 +1370,40 @@ fn meter(
 
 fn short_name(name: &str) -> String {
     name.trim_end_matches(":latest").to_string()
+}
+
+/// Turn what Ollama really did into one line the person can act on.
+fn load_message(
+    model: &str,
+    wanted: u32,
+    cloud: bool,
+    report: ollama::LoadReport,
+) -> (bool, String) {
+    let short = short_name(model);
+    if !report.resident {
+        if cloud {
+            return (
+                true,
+                format!("{short} runs in the cloud · nothing on this PC"),
+            );
+        }
+        return (
+            false,
+            format!(
+                "{short} did not stay in memory at {} · Ollama ran out of room",
+                fmt_ctx(wanted)
+            ),
+        );
+    }
+    let mut text = format!("{short} ready · {} context", fmt_ctx(report.ctx));
+    if report.ctx > 0 && report.ctx < wanted {
+        text.push_str(&format!(" (capped from {})", fmt_ctx(wanted)));
+    }
+    let on_cpu = report.on_cpu();
+    if report.size > 0 && on_cpu > report.size / 20 {
+        text.push_str(&format!(" · {} in RAM", fmt_bytes(on_cpu)));
+    }
+    (true, text)
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -1330,10 +1477,7 @@ fn parse_epoch(text: &str) -> Option<i64> {
 
 fn expiry_left(expires: &str) -> Option<String> {
     let at = parse_epoch(expires)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs() as i64;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     let left = at - now;
     if left <= 0 {
         return Some("expiring".to_string());
@@ -1364,10 +1508,9 @@ fn install_look(ctx: &egui::Context) {
         ),
     ];
     for (name, bytes, family) in bundled {
-        fonts.font_data.insert(
-            name.to_string(),
-            Arc::new(FontData::from_static(bytes)),
-        );
+        fonts
+            .font_data
+            .insert(name.to_string(), Arc::new(FontData::from_static(bytes)));
         fonts
             .families
             .entry(family)
@@ -1521,12 +1664,69 @@ fn main() -> eframe::Result<()> {
     if let Err(err) = &result {
         eprintln!("ollama-deck: could not open a window: {err}");
     }
-    if wants_shot
-        && result.is_ok()
-        && !SHOT_SAVED.load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if wants_shot && result.is_ok() && !SHOT_SAVED.load(std::sync::atomic::Ordering::SeqCst) {
         eprintln!("ollama-deck: the window closed before a picture was drawn");
         std::process::exit(1);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ollama::LoadReport;
+
+    fn report(ctx: u32, size: u64, vram: u64) -> LoadReport {
+        LoadReport {
+            resident: true,
+            ctx,
+            size,
+            size_vram: vram,
+        }
+    }
+
+    #[test]
+    fn a_clean_load_says_ready_with_the_context() {
+        let (ok, text) = load_message("llama3.2:3b", 8192, false, report(8192, 2_000, 2_000));
+        assert!(ok);
+        assert_eq!(text, "llama3.2:3b ready · 8k context");
+    }
+
+    #[test]
+    fn a_capped_context_is_named() {
+        let (ok, text) = load_message(
+            "qwen2.5-coder:14b",
+            65536,
+            false,
+            report(32768, 2_000, 2_000),
+        );
+        assert!(ok);
+        assert!(text.contains("capped from 64k"), "got {text}");
+        assert!(text.contains("32k"), "got {text}");
+    }
+
+    #[test]
+    fn spill_to_system_ram_is_named() {
+        let (_, text) = load_message(
+            "qwen2.5-coder:14b",
+            32768,
+            false,
+            report(32768, 14_200_000_000, 13_050_000_000),
+        );
+        assert!(text.contains("in RAM"), "got {text}");
+    }
+
+    #[test]
+    fn a_model_that_vanished_is_an_error_not_a_success() {
+        let (ok, text) = load_message("llama3.2:3b", 8192, false, LoadReport::default());
+        assert!(!ok);
+        assert!(text.contains("did not stay in memory"), "got {text}");
+    }
+
+    #[test]
+    fn a_cloud_model_is_not_expected_to_be_resident() {
+        let (ok, text) = load_message("kimi-k2:cloud", 8192, true, LoadReport::default());
+        assert!(ok);
+        assert!(text.contains("cloud"), "got {text}");
+    }
 }
