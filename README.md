@@ -52,6 +52,22 @@ curl -fsSL https://raw.githubusercontent.com/mjb73/ollama-deck/main/get.sh | sh
 
 It downloads the latest Linux build from the [releases page](https://github.com/mjb73/ollama-deck/releases),
 puts `ollama-deck` in `~/.local/bin` and adds an **Ollama Deck** entry to your application menu.
+No root is needed.
+
+If `curl` is unavailable (or your system's curl cannot reach GitHub), use the same script with
+`wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/mjb73/ollama-deck/main/get.sh | sh
+```
+
+The installer tries `curl` first and falls back to `wget` automatically. If both fail it prints
+the release page and the direct download link instead of a terse error. When installing by hand,
+download `ollama-deck-linux-x86_64.tar.gz` from the latest release, unpack it and run the
+`ollama-deck` file inside.
+
+The prebuilt binary is for 64-bit Linux (x86_64) and needs a reasonably current glibc
+(Ubuntu 22.04 or newer, Debian 12+, Fedora 37+, Arch). On other systems, build from source below.
 
 ### From source
 

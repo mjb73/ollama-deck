@@ -31,15 +31,26 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 say "Downloading Ollama Deck..."
+downloaded=0
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$URL" -o "$TMP/$ASSET" || die "download failed - see https://github.com/${REPO}/releases"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TMP/$ASSET" "$URL" || die "download failed - see https://github.com/${REPO}/releases"
-else
-    die "neither curl nor wget is installed"
+    if curl -fsSL "$URL" -o "$TMP/$ASSET"; then
+        downloaded=1
+    else
+        say "curl could not download the release; trying wget..."
+    fi
+fi
+if [ "$downloaded" -eq 0 ] && command -v wget >/dev/null 2>&1; then
+    if wget -qO "$TMP/$ASSET" "$URL"; then
+        downloaded=1
+    fi
+fi
+if [ "$downloaded" -eq 0 ]; then
+    die "download failed. Check your internet connection, or open
+    https://github.com/${REPO}/releases/latest
+and download ${ASSET} by hand."
 fi
 
-tar -xzf "$TMP/$ASSET" -C "$TMP"
+tar -xzf "$TMP/$ASSET" -C "$TMP" || die "the download was not a valid archive - see https://github.com/${REPO}/releases"
 [ -f "$TMP/ollama-deck" ] || die "the download did not contain the program"
 
 mkdir -p "$BIN_DIR"
