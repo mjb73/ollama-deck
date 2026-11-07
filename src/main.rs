@@ -1620,8 +1620,12 @@ fn main() -> eframe::Result<()> {
             }
         } else if let Some(value) = arg.strip_prefix("--screenshot=") {
             shot_path = Some(PathBuf::from(value));
+        } else if arg == "--version" || arg == "-V" {
+            println!("ollama-deck {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
         } else if arg == "--help" || arg == "-h" {
-            println!("ollama-deck - load, unload and watch Ollama models");
+            println!("ollama-deck {}", env!("CARGO_PKG_VERSION"));
+            println!("  load, unload and watch Ollama models");
             println!("  --screenshot <file.png>   draw the widget, save a picture, exit");
             return Ok(());
         }

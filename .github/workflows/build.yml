@@ -36,15 +36,20 @@ jobs:
           cp README.md LICENSE install.sh get.sh dist/
           cp -r assets dist/
           tar -C dist -czf ollama-deck-linux-x86_64.tar.gz .
-          ls -lh ollama-deck-linux-x86_64.tar.gz
+          sha256sum ollama-deck-linux-x86_64.tar.gz > ollama-deck-linux-x86_64.tar.gz.sha256
+          ls -lh ollama-deck-linux-x86_64.tar.gz*
 
       - uses: actions/upload-artifact@v4
         with:
           name: ollama-deck-linux-x86_64
-          path: ollama-deck-linux-x86_64.tar.gz
+          path: |
+            ollama-deck-linux-x86_64.tar.gz
+            ollama-deck-linux-x86_64.tar.gz.sha256
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ollama-deck-linux-x86_64.tar.gz
+          files: |
+            ollama-deck-linux-x86_64.tar.gz
+            ollama-deck-linux-x86_64.tar.gz.sha256

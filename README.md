@@ -61,8 +61,9 @@ If `curl` is unavailable (or your system's curl cannot reach GitHub), use the sa
 wget -qO- https://raw.githubusercontent.com/mjb73/ollama-deck/main/get.sh | sh
 ```
 
-The installer tries `curl` first and falls back to `wget` automatically. If both fail it prints
-the release page and the direct download link instead of a terse error. When installing by hand,
+The installer tries `curl` first and falls back to `wget` automatically. It also picks the newest
+release that actually contains the download, verifies the published SHA-256 checksum, and prints
+the release page with the direct asset link if something fails. When installing by hand,
 download `ollama-deck-linux-x86_64.tar.gz` from the latest release, unpack it and run the
 `ollama-deck` file inside.
 
