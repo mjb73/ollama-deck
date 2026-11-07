@@ -26,6 +26,9 @@ fi
 echo "Building Ollama Deck (the first build takes a few minutes)..."
 cargo build --release
 
+echo "Checking the build..."
+"target/release/${BIN_NAME}" --version
+
 echo "Installing to ${BIN_DIR}"
 mkdir -p "${BIN_DIR}"
 install -m 755 "target/release/${BIN_NAME}" "${BIN_DIR}/${BIN_NAME}"
@@ -39,6 +42,7 @@ Comment=Load, unload and watch Ollama models
 Exec=${BIN_DIR}/${BIN_NAME}
 Icon=${ICON_DIR}/${BIN_NAME}.svg
 Terminal=false
+StartupWMClass=${BIN_NAME}
 Categories=Utility;System;
 Keywords=ollama;llm;vram;gpu;
 EOF

@@ -62,13 +62,34 @@ wget -qO- https://raw.githubusercontent.com/mjb73/ollama-deck/main/get.sh | sh
 ```
 
 The installer tries `curl` first and falls back to `wget` automatically. It also picks the newest
-release that actually contains the download, verifies the published SHA-256 checksum, and prints
-the release page with the direct asset link if something fails. When installing by hand,
-download `ollama-deck-linux-x86_64.tar.gz` from the latest release, unpack it and run the
-`ollama-deck` file inside.
+release that actually contains the download, checks the published SHA-256 checksum, starts the
+downloaded program once to prove it runs on this machine, and prints the release page with the
+direct asset link if something fails. Nothing is changed on your computer unless all of that
+succeeds.
+
+Check it afterwards:
+
+```bash
+ollama-deck --version
+```
+
+When installing by hand, download `ollama-deck-linux-x86_64.tar.gz` from the latest release,
+unpack it and run the `ollama-deck` file inside.
 
 The prebuilt binary is for 64-bit Linux (x86_64) and needs a reasonably current glibc
 (Ubuntu 22.04 or newer, Debian 12+, Fedora 37+, Arch). On other systems, build from source below.
+
+### If the one-line install stops with an error
+
+- **"the download did not work"** — the newest release had no file attached yet (a build can be
+  uploading for a minute) or GitHub was unreachable. The message names the exact address to open
+  in a browser. Wait a minute and run the same line again.
+- **"could not open a window"** or a warning about missing libraries — the desktop is missing
+  OpenGL or X11/KDE libraries. The installer prints the package command for your distribution.
+- **"needs a newer system library"** — the distribution is older than the build machine. The
+  message gives the two-line source build, which needs Rust.
+- **`ollama-deck: command not found`** — `~/.local/bin` is not on your `PATH`. Start the app from
+  the application menu, or run `~/.local/bin/ollama-deck`.
 
 ### From source
 
@@ -147,6 +168,7 @@ it is close enough to choose a context size with.
 ```bash
 cargo run
 cargo run -- --screenshot shot.png   # draw the window, save a PNG, exit
+cargo run -- --version               # print the version, exit
 ```
 
 ## Fonts

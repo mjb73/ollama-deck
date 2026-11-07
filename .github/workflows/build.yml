@@ -29,6 +29,11 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Smoke test the binary
+        run: |
+          ./target/release/ollama-deck --version
+          ./target/release/ollama-deck --help
+
       - name: Package
         run: |
           mkdir -p dist
