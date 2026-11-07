@@ -1,0 +1,102 @@
+# Ollama Deck
+
+A small desktop widget for Linux that shows what your Ollama models are doing and lets you
+load, unload and tune them from one compact window.
+
+![the widget](docs/preview.png)
+
+It sits in a corner of the screen (always on top by default), polls your local Ollama server
+once a second, and draws live CPU, RAM and VRAM graphs next to your model list.
+
+## What it does
+
+- **Pick a model** from everything `ollama list` would show, with its size, quantisation and parameter count.
+- **Pick the context size** with one-click chips (2k … 128k) or a fine slider, and see the VRAM the choice will need before you commit to it.
+- **Load** a model into memory at that context size, or **Unload** it (or any other resident model) to free memory immediately.
+- **Keep-alive** control: 5 minutes, 15 minutes, 1 hour or forever — how long Ollama keeps the model resident after you stop using it.
+- **Live monitor**: system CPU, RAM and GPU memory usage with a one-minute sparkline, plus GPU load and the RSS/CPU of the `ollama` process itself.
+- **Stays on top** so it can live beside your editor. The TOP button toggles that.
+
+## Requirements
+
+- Linux with a graphical session (X11 or Wayland)
+- [Ollama](https://ollama.com) running locally (`ollama serve`, the desktop app, or systemd)
+- For the VRAM graph: the NVIDIA driver (`nvidia-smi`), or an AMD card exposing `mem_info_vram_used` in sysfs
+- Rust 1.80+ **only if you build from source** — the installer above ships a ready-made binary
+
+Without a GPU the widget still works — it simply says "no GPU" instead of drawing VRAM.
+
+## Install
+
+One line, nothing else to install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mjb73/ollama-deck/main/get.sh | sh
+```
+
+It downloads the latest Linux build from the [releases page](https://github.com/mjb73/ollama-deck/releases),
+puts `ollama-deck` in `~/.local/bin` and adds an **Ollama Deck** entry to your application menu.
+
+### From source
+
+```bash
+git clone https://github.com/mjb73/ollama-deck.git
+cd ollama-deck
+./install.sh
+```
+
+The script builds a release binary (a few minutes the first time), installs it to
+`~/.local/bin/ollama-deck` and adds the menu entry. If you prefer to do it by hand:
+
+```bash
+cargo install --path . --locked
+```
+
+## Use
+
+Launch **Ollama Deck** from the menu, or run `ollama-deck`.
+
+1. Pick a model. If something is already loaded, the widget selects it for you.
+2. Pick a context size. The line under the chips shows roughly how much VRAM the weights plus
+   the key/value cache will take; the pill on the right says whether that still fits next to
+   whatever is already resident.
+3. Press **Load**. The resident list appears above the graphs with its size, context and how
+   long it has left before Ollama evicts it.
+4. Press the small × on a resident model to unload it, or **Unload** for the selected one.
+
+The window is resizable and remembers nothing between runs — it simply reflects the server.
+
+## How it works
+
+Everything goes through Ollama's own HTTP API on `127.0.0.1:11434` (override with `OLLAMA_HOST`):
+
+| Action | Endpoint |
+| --- | --- |
+| model list | `GET /api/tags` |
+| resident models | `GET /api/ps` |
+| model shape (context limit, KV heads) | `POST /api/show` |
+| load at a context size | `POST /api/generate` with `options.num_ctx` and `keep_alive` |
+| unload | `POST /api/generate` with `keep_alive: 0` |
+
+System numbers come from `/proc/stat`, `/proc/meminfo`, `nvidia-smi` (or AMD sysfs) and the
+`ollama` process's own `/proc/<pid>/stat`. No Python, no daemon, no background service: one
+process, one window.
+
+The VRAM estimate is weights + `num_ctx × kv_heads × (key_len + value_len) × 2 bytes`, read from
+the model metadata. It is an estimate — Ollama's own allocation rounding varies a little — but
+it is close enough to choose a context size with.
+
+## Development
+
+```bash
+cargo run
+cargo run -- --screenshot shot.png   # draw the window, save a PNG, exit
+```
+
+## Fonts
+
+Bundled: Fira Sans and Hack, both under the SIL Open Font License (see `assets/FIRA-OFL.txt`).
+
+## License
+
+MIT — see `LICENSE`.
