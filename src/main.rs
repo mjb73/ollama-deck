@@ -43,6 +43,10 @@ const VIOLET: Color32 = Color32::from_rgb(178, 158, 245);
 
 const HISTORY: usize = 72;
 const SHOT_FRAME: u64 = 120;
+
+/// Set once a `--screenshot` capture has been written, so a run that never
+/// painted a picture can report it instead of exiting quietly.
+static SHOT_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const KEEP_ALIVE: [i64; 4] = [5, 15, 60, -1];
 const WIN_W: f32 = 396.0;
 const WIN_H: f32 = 646.0;
@@ -887,7 +891,10 @@ impl eframe::App for Deck {
                 let ctx2 = ctx.clone();
                 ctx.request_screenshot(move |image| {
                     match save_png(&path, &image) {
-                        Ok(()) => eprintln!("ollama-deck: saved {}", path.display()),
+                        Ok(()) => {
+                            SHOT_SAVED.store(true, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!("ollama-deck: saved {}", path.display());
+                        }
                         Err(e) => eprintln!("ollama-deck: screenshot failed: {e}"),
                     }
                     ctx2.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1504,6 +1511,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let wants_shot = shot_path.is_some();
     let result = eframe::run_native(
         "Ollama Deck",
         options,
@@ -1512,6 +1520,13 @@ fn main() -> eframe::Result<()> {
 
     if let Err(err) = &result {
         eprintln!("ollama-deck: could not open a window: {err}");
+    }
+    if wants_shot
+        && result.is_ok()
+        && !SHOT_SAVED.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        eprintln!("ollama-deck: the window closed before a picture was drawn");
+        std::process::exit(1);
     }
     result
 }
