@@ -101,6 +101,7 @@ struct Deck {
     samples: u32,
     started: Instant,
     shot_fired: bool,
+    shot_at: Option<Instant>,
 }
 
 impl Deck {
@@ -138,6 +139,7 @@ impl Deck {
             samples: 0,
             started: Instant::now(),
             shot_fired: false,
+            shot_at: None,
         };
         app.refresh_models();
         monitor::spawn(app.tx.clone());
@@ -865,14 +867,23 @@ impl eframe::App for Deck {
             } else {
                 egui::WindowLevel::Normal
             }));
+            if self.shot_path.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
         }
 
         if let Some(path) = self.shot_path.clone() {
             ctx.request_repaint();
-            let settled = self.frames >= SHOT_FRAME
-                && (self.samples >= 6 || self.started.elapsed() > Duration::from_secs(9));
+            let waited = self.started.elapsed();
+            // Aim for a fixed number of frames, but never hang on them: a
+            // compositor can stop handing out frames to a window that ends up
+            // behind another one, so a wall-clock deadline takes over.
+            let settled = (self.frames >= SHOT_FRAME
+                && (self.samples >= 6 || waited > Duration::from_secs(9)))
+                || (self.frames >= 4 && waited > Duration::from_secs(4));
             if settled && !self.shot_fired {
                 self.shot_fired = true;
+                self.shot_at = Some(Instant::now());
                 let ctx2 = ctx.clone();
                 ctx.request_screenshot(move |image| {
                     match save_png(&path, &image) {
@@ -882,8 +893,10 @@ impl eframe::App for Deck {
                     ctx2.send_viewport_cmd(egui::ViewportCommand::Close);
                 });
             }
-            if self.shot_fired && self.frames > SHOT_FRAME + 240 {
-                std::process::exit(0);
+            if let Some(at) = self.shot_at {
+                if self.frames > SHOT_FRAME + 240 || at.elapsed() > Duration::from_secs(3) {
+                    std::process::exit(0);
+                }
             }
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -1465,14 +1478,24 @@ fn main() -> eframe::Result<()> {
         i += 1;
     }
 
+    // The screenshot path may run while the session is locked, where Wayland
+    // stops delivering frame callbacks and the window never paints. X11 (used
+    // through XWayland when present) paints regardless, so prefer it there.
+    if shot_path.is_some() && std::env::var_os("DISPLAY").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Ollama Deck")
         .with_app_id("ollama-deck")
         .with_inner_size(Vec2::new(WIN_W, WIN_H))
         .with_min_inner_size(Vec2::new(350.0, 566.0))
-        .with_resizable(true);
-    if shot_path.is_none() {
-        viewport = viewport.with_always_on_top();
+        .with_resizable(true)
+        // Keep the window visible while it is being captured: a compositor
+        // that hides it refuses to hand out frames and the picture never lands.
+        .with_always_on_top();
+    if shot_path.is_some() {
+        viewport = viewport.with_visible(true);
     }
 
     let options = eframe::NativeOptions {
